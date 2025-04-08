@@ -1017,7 +1017,7 @@ def main(args=None):
     ojob.add_condor_cmd('+InitialRequestMemory', f'{reqmem}')
     ojob.add_condor_cmd('request_memory', f'ifthenelse(isUndefined(MemoryUsage), {reqmem}, int(3*MemoryUsage))')
     ojob.add_condor_cmd('periodic_release', '(HoldReasonCode =?= 26 || HoldReasonCode =?= 34) && (JobStatus == 5)')
-    ojob.add_condor_cmd('periodic_remove', '(JobStatus == 1) && MemoryUsage >= 7G')
+    ojob.add_condor_cmd('periodic_remove', '(JobStatus == 1) && MemoryUsage >= 7000')
 
     ojob.add_condor_cmd('+OmicronProcess', f'"{group}"')
 
@@ -1032,7 +1032,7 @@ def main(args=None):
                          f'ifthenelse(isUndefined(MemoryUsage), {ppmem}, int(3*MemoryUsage))')
     ppjob.add_condor_cmd('periodic_release',
                          '(HoldReasonCode =?= 26 || HoldReasonCode =?= 34) && (JobStatus == 5)')
-    ppjob.add_condor_cmd('periodic_remove', '(JobStatus == 1) && MemoryUsage >= 7G')
+    ppjob.add_condor_cmd('periodic_remove', '(JobStatus == 1) && MemoryUsage >= 7000')
 
     ppjob.add_condor_cmd('environment', '"HDF5_USE_FILE_LOCKING=FALSE"')
     ppjob.add_short_opt('e', '')
