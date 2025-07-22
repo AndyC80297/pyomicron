@@ -379,6 +379,13 @@ https://pyomicron.readthedocs.io/en/latest/"""
              "Can be given multiple times (default: %(default)s)",
     )
 
+    condorg.add_argument(
+        '--auth-type',
+        choices=['x509', 'igwn', 'scitoken'],
+        default='scitoken',
+        help='How to authenticate to dqsegdb, datafind, and cvmfs'
+    )
+
     # input data options
     datag = parser.add_argument_group('Data options')
     dataexc = datag.add_mutually_exclusive_group()
@@ -996,10 +1003,38 @@ def main(args=None):
     dag.set_dag_file(str(dagpath.with_suffix("")))
 
     # set up condor commands for all jobs
-    condorcmds = {'accounting_group': args.condor_accounting_group,
-                  'accounting_group_user': args.condor_accounting_group_user,
-                  'request_disk': args.condor_request_disk,
-                  'use_x509userproxy': 'True'}
+    base_condorcmds = {
+        "accounting_group": args.condor_accounting_group,
+        "accounting_group_user": args.condor_accounting_group_user,
+        "request_disk": args.condor_request_disk,
+        "request_memory": '1024',   # units are MB but  cannot be specified here
+    }
+    condor_igwn_auth = {
+        # scitokens needed for dqsegdb
+        'use_oauth_services': 'igwn',
+        'igwn_oauth_options_dqsegdb': "--role $ENV('TOKEN_ROLE') --credkey $ENV('TOKEN_CREDKEY')",
+        'igwn_oauth_resource_dqsegdb': 'https: // segments.ligo.org',
+        'igwn_oauth_permissions_dqsegdb': 'dqsegdb.read',
+        'environment': '"BEARER_TOKEN_FILE=$$(_CONDOR_SCRATCH_DIR)/.condor_creds/igwn_dqsegdb.use"'
+    }
+    condor_apissuer_auth = {
+        'use_oauth_services': 'scitokens',
+    }
+    condor_x509_auth = {
+        'getenv': 'X509_USER_PROXY, KRB5CNAME'
+    }
+    if args.auth_type == 'x509':
+        condorcmds = dict(base_condorcmds | condor_x509_auth)
+    elif args.auth_type == 'igwn':
+        condorcmds = dict(base_condorcmds | condor_igwn_auth)
+    elif args.auth_type == 'scitokens':
+        condorcmds = dict(base_condorcmds | condor_apissuer_auth)
+    else:
+        condorcmds = base_condorcmds.copy()
+        logger.warning('We do not know how to authenticate to dqsegdb or cvmfs')
+
+    condorcmds: dict[str, str]
+
     for cmd_ in args.condor_command:
         key, value = cmd_.split('=', 1)
         condorcmds[key.rstrip().lower()] = value.strip()
