@@ -67,6 +67,7 @@ import argparse
 import configparser
 import os
 import re
+import shlex
 import sys
 import shutil
 import time
@@ -94,8 +95,49 @@ except RuntimeError:
     OMICRON_PATH = None
 
 DAG_TAG = "omicron"
+LIGO_SUBMIT_TEMPLATE_FIELDS = (
+    "@WORKER_SCRIPT@",
+    "@WORKER_NAME@",
+    "@FRAME_CACHE@",
+    "@FRAME_FILES@",
+    "@TRIGGER_OUTPUT_DIR@",
+    "@LOG_DIR@",
+)
 
 logger = log.Logger('omicron-process')
+
+
+def write_ligo_submit_file(template, outfile, worker_script, frame_cache,
+                           frame_files, trigger_output_dir, log_dir):
+    """Write a DAG-compatible submit file from a LIGO submit template."""
+    contents = Path(template).read_text()
+    required = LIGO_SUBMIT_TEMPLATE_FIELDS + tuple(
+        f"$(macroargument{i})" for i in range(4)
+    )
+    missing = [field for field in required if field not in contents]
+    if missing:
+        raise ValueError(
+            "LIGO submit template is missing required placeholders or DAG "
+            "arguments: "
+            + ", ".join(missing),
+        )
+    if not any(
+        line.strip().lower() == "queue 1"
+        for line in contents.splitlines()
+    ):
+        raise ValueError("LIGO DAG-node submit template must contain `queue 1`")
+
+    replacements = {
+        "@WORKER_SCRIPT@": str(worker_script),
+        "@WORKER_NAME@": Path(worker_script).name,
+        "@FRAME_CACHE@": str(frame_cache),
+        "@FRAME_FILES@": ", ".join(map(str, frame_files)),
+        "@TRIGGER_OUTPUT_DIR@": str(trigger_output_dir),
+        "@LOG_DIR@": str(log_dir),
+    }
+    for field, value in replacements.items():
+        contents = contents.replace(field, value)
+    Path(outfile).write_text(contents)
 
 
 def clean_exit(exitcode, tempfiles=None):
@@ -320,6 +362,20 @@ https://pyomicron.readthedocs.io/en/latest/"""
         help='condor universe (default: %(default)s)',
     )
     condorg.add_argument(
+        '--condor-submit-template',
+        type=Path,
+        help='LIGO DAG-node submit template; transfers the generated '
+             'parameters and frame files to the worker. The one-node test '
+             'requires one segment and parameter file; the template must '
+             'include the required placeholders and use queue 1',
+    )
+    condorg.add_argument(
+        '--worker-executable',
+        default='/cvmfs/software.igwn.org/conda/envs/igwn-py311/bin/omicron',
+        help='Omicron executable available on the worker when using '
+             '--condor-submit-template (default: %(default)s)',
+    )
+    condorg.add_argument(
         '--executable',
         default=OMICRON_PATH,
         help='omicron executable (default: %(default)s)',
@@ -467,6 +523,16 @@ def main(args=None):
 
     parser = create_parser()
     args = parser.parse_args(args=args)
+
+    if args.condor_submit_template and not args.condor_submit_template.is_file():
+        parser.error(
+            f"LIGO submit template does not exist: "
+            f"{args.condor_submit_template}",
+        )
+    if args.condor_submit_template and args.skip_omicron:
+        parser.error(
+            "--condor-submit-template cannot be used with --skip-omicron",
+        )
 
     # apply verbosity to logger
     args.verbose = max(5 - args.verbose, 0)
@@ -965,6 +1031,12 @@ def main(args=None):
     elif len(segs) == 0:
         raise RuntimeError("No analysable segments found")
 
+    if args.condor_submit_template and newdag and len(segs) != 1:
+        raise ValueError(
+            "The LIGO submit-template test requires exactly one "
+            "analyzable data segment; narrow the --gps interval",
+        )
+
     # and calculate trigger output segments
     trigsegs = type(segs)(type(s)(*s) for s in segs).contract(padding)
 
@@ -988,12 +1060,81 @@ def main(args=None):
     # -- make parameters files then generate the DAG --------------------------
 
     fileformats = oconfig.output_formats()
+    transfer_frames = []
+    transfer_cache = None
+    worker_script = None
+    if args.condor_submit_template and newdag:
+        transfer_frames = list(dict.fromkeys(
+            Path(data.path_from_file_url(str(frame))).resolve()
+            for frame in cache
+        ))
+        if not transfer_frames:
+            raise RuntimeError(
+                "No frame files are available to transfer to the LIGO worker",
+            )
+        if any(not frame.is_file() for frame in transfer_frames):
+            raise RuntimeError(
+                "Cannot transfer one or more frame files because they are "
+                "not accessible as local files",
+            )
+        frame_names = [frame.name for frame in transfer_frames]
+        if len(set(frame_names)) != len(frame_names):
+            raise ValueError(
+                "Frame files with duplicate basenames cannot be transferred "
+                "to a single worker directory",
+            )
+        if any(',' in str(frame) for frame in transfer_frames):
+            raise ValueError(
+                "Frame file paths containing commas cannot be used with "
+                "HTCondor transfer_input_files",
+            )
+
+        group_tag = re.sub(r'[^A-Za-z0-9_-]+', '_', group)
+        frame_cache_name = f"frames-{group_tag}.lcf"
+        transfer_cache = condir / frame_cache_name
+        with cachefile.open() as source, transfer_cache.open("w") as target:
+            for line in source:
+                prefix, frame_path = line.rstrip().rsplit(maxsplit=1)
+                print(
+                    prefix,
+                    Path(data.path_from_file_url(frame_path)).name,
+                    file=target,
+                )
+        tempfiles.extend([transfer_cache])
+
+        worker_script = condir / f"omicron-worker-{group_tag}.sh"
+        with worker_script.open("w") as script:
+            print("#!/bin/bash -e", file=script)
+            print(
+                "exec {} \"$1\" \"$2\" \"$3\" strict".format(
+                    shlex.quote(args.worker_executable),
+                ),
+                file=script,
+            )
+        worker_script.chmod(0o755)
+        tempfiles.append(worker_script)
+
+        # These parameter-file paths are relative to the worker sandbox.
+        oconfig.set('DATA', 'FFL', frame_cache_name)
+        oconfig.set('OUTPUT', 'DIRECTORY', 'triggers_test')
 
     # generate a 'master' parameters.txt file for archival purposes
     if not newdag:  # if not writing new dag, dump parameters.txt files to /tmp
         pardir = gettempdir()
     parfile, jobfiles = oconfig.write_distributed(
         pardir, nchannels=args.max_channels_per_job)
+    if args.condor_submit_template and newdag:
+        if len(jobfiles) != 1:
+            raise ValueError(
+                "The LIGO submit-template test creates one DAG node; "
+                "increase --max-channels-per-job to include all channels",
+            )
+        # Keep the archived master parameters file usable from the run
+        # directory; only the per-node files use sandbox-relative paths.
+        oconfig.set('DATA', 'FFL', str(cachefile))
+        oconfig.set('OUTPUT', 'DIRECTORY', str(trigdir))
+        with open(parfile, 'w') as f:
+            oconfig.write(f)
     logger.debug(f"Created master parameters file\n{parfile}")
     if newdag:
         keepfiles.append(parfile)
@@ -1117,8 +1258,18 @@ def main(args=None):
         td = te - ts
 
         # distribute segment across multiple nodes
-        nodesegs = oconfig.distribute_segment(
-            s, e, nperjob=args.max_chunks_per_job)
+        nperjob = args.max_chunks_per_job
+        if args.condor_submit_template and newdag:
+            chunk = oconfig.getfloat('PARAMETER', 'PSDLENGTH')
+            overlap = oconfig.getfloats('PARAMETER', 'TIMING')[1]
+            step = int(chunk - overlap)
+            nperjob = max(nperjob, (e - s + step - 1) // step)
+        nodesegs = oconfig.distribute_segment(s, e, nperjob=nperjob)
+        if args.condor_submit_template and newdag and len(nodesegs) != 1:
+            raise RuntimeError(
+                "The LIGO submit-template test could not combine the "
+                "selected segment into one Omicron node",
+            )
 
         omicronfiles = dict()
         # build node for each parameter file
@@ -1137,6 +1288,8 @@ def main(args=None):
                     node.add_var_arg(str(subseg[0]))
                     node.add_var_arg(str(subseg[1]))
                     node.add_file_arg(pf)
+                    if args.condor_submit_template and newdag:
+                        node.add_var_arg(Path(pf).name)
                     # we need to ignore errors in individual nodes
                     node.set_post_script(shutil.which('bash'))
                     node.add_post_script_arg('-c')
@@ -1345,6 +1498,16 @@ def main(args=None):
         )
     elif newdag:
         dag.write_sub_files()
+        if args.condor_submit_template:
+            write_ligo_submit_file(
+                args.condor_submit_template,
+                ojob.get_sub_file(),
+                worker_script,
+                transfer_cache,
+                transfer_frames,
+                trigdir,
+                logdir,
+            )
         dag.write_dag()
         dag.write_script()
         with open(dagfile, 'a') as f:
