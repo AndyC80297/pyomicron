@@ -100,7 +100,8 @@ LIGO_SUBMIT_TEMPLATE_FIELDS = (
     "@WORKER_NAME@",
     "@FRAME_CACHE@",
     "@FRAME_FILES@",
-    "@TRIGGER_OUTPUT_DIR@",
+    "@TRIGGER_OUTPUT_FILES@",
+    "@TRIGGER_OUTPUT_REMAPS@",
     "@LOG_DIR@",
 )
 
@@ -108,7 +109,8 @@ logger = log.Logger('omicron-process')
 
 
 def write_ligo_submit_file(template, outfile, worker_script, frame_cache,
-                           frame_files, trigger_output_dir, log_dir):
+                           frame_files, channels, trigger_output_dir,
+                           log_dir):
     """Write a DAG-compatible submit file from a LIGO submit template."""
     contents = Path(template).read_text()
     required = LIGO_SUBMIT_TEMPLATE_FIELDS + tuple(
@@ -121,6 +123,14 @@ def write_ligo_submit_file(template, outfile, worker_script, frame_cache,
             "arguments: "
             + ", ".join(missing),
         )
+    channels = tuple(channels)
+    if not channels:
+        raise ValueError("No channels were provided for output transfer")
+    if any("," in channel or ";" in channel for channel in channels):
+        raise ValueError(
+            "Channel names containing commas or semicolons cannot be used "
+            "with HTCondor output transfer",
+        )
     if not any(
         line.strip().lower() == "queue 1"
         for line in contents.splitlines()
@@ -132,7 +142,11 @@ def write_ligo_submit_file(template, outfile, worker_script, frame_cache,
         "@WORKER_NAME@": Path(worker_script).name,
         "@FRAME_CACHE@": str(frame_cache),
         "@FRAME_FILES@": ", ".join(map(str, frame_files)),
-        "@TRIGGER_OUTPUT_DIR@": str(trigger_output_dir),
+        "@TRIGGER_OUTPUT_FILES@": ", ".join(channels),
+        "@TRIGGER_OUTPUT_REMAPS@": "; ".join(
+            f"{channel} = {Path(trigger_output_dir) / channel}"
+            for channel in channels
+        ),
         "@LOG_DIR@": str(log_dir),
     }
     for field, value in replacements.items():
@@ -1116,7 +1130,7 @@ def main(args=None):
 
         # These parameter-file paths are relative to the worker sandbox.
         oconfig.set('DATA', 'FFL', frame_cache_name)
-        oconfig.set('OUTPUT', 'DIRECTORY', 'triggers_test')
+        oconfig.set('OUTPUT', 'DIRECTORY', '.')
 
     # generate a 'master' parameters.txt file for archival purposes
     if not newdag:  # if not writing new dag, dump parameters.txt files to /tmp
@@ -1505,6 +1519,7 @@ def main(args=None):
                 worker_script,
                 transfer_cache,
                 transfer_frames,
+                oconfig.getlist('DATA', 'CHANNELS'),
                 trigdir,
                 logdir,
             )
