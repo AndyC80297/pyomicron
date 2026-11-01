@@ -1,0 +1,30 @@
+universe                 = vanilla
+getenv                   = False
+
+executable               = /bin/bash
+transfer_executable      = False
+arguments                = "@WORKER_NAME@ $(macroargument0) $(macroargument1) $(macroargument3)"
+
+should_transfer_files    = YES
+when_to_transfer_output  = ON_EXIT
+transfer_input_files     = @WORKER_SCRIPT@, @FRAME_CACHE@, $(macroargument2), @FRAME_FILES@
+transfer_output_files    = @TRIGGER_OUTPUT_FILES@
+transfer_output_remaps   = "@TRIGGER_OUTPUT_REMAPS@"
+
+accounting_group         = ligo.dev.o4.detchar.transient.omicron
+accounting_group_user    = shihhong.hsu
+
+error                    = @LOG_DIR@/omicron-$(cluster)-$(process).err
+output                   = @LOG_DIR@/omicron-$(cluster)-$(process).out
+log                      = @LOG_DIR@/omicron-$(cluster)-$(process).log
+stream_output            = True
+stream_error             = True
+
+request_memory           = ifthenelse(isUndefined(MemoryUsage), 1024, int(3*MemoryUsage))
++InitialRequestMemory    = 4096
+request_disk             = 1G
+periodic_release         = (HoldReasonCode =?= 26 || HoldReasonCode =?= 34) && (JobStatus == 5)
+periodic_remove          = (JobStatus == 1) && MemoryUsage >= 7000
++OmicronProcess          = "@OMICRON_PROCESS@"
+
+queue 1

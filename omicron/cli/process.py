@@ -110,7 +110,7 @@ logger = log.Logger('omicron-process')
 
 def write_ligo_submit_file(template, outfile, worker_script, frame_cache,
                            frame_files, channels, trigger_output_dir,
-                           log_dir):
+                           log_dir, group):
     """Write a DAG-compatible submit file from a LIGO submit template."""
     contents = Path(template).read_text()
     required = LIGO_SUBMIT_TEMPLATE_FIELDS + tuple(
@@ -148,6 +148,7 @@ def write_ligo_submit_file(template, outfile, worker_script, frame_cache,
             for channel in channels
         ),
         "@LOG_DIR@": str(log_dir),
+        "@OMICRON_PROCESS@": group,
     }
     for field, value in replacements.items():
         contents = contents.replace(field, value)
@@ -1522,6 +1523,7 @@ def main(args=None):
                 oconfig.getlist('DATA', 'CHANNELS'),
                 trigdir,
                 logdir,
+                group,
             )
         dag.write_dag()
         dag.write_script()
