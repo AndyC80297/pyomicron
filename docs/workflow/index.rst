@@ -75,6 +75,17 @@ The DAG will normally do something like this:
     file ``chunkdur`` parameter, which includes the padding. The nominal value
     is 120 sec. This results in multiple htCondor jobs.
 
+To run merge/post-processing jobs on worker nodes with explicit file transfer,
+pass ``--post-process-template`` with a submit file such as
+``templates/ligo_omicron_post_process.sub``. The template must use
+``$(macroargument0)`` through ``$(macroargument4)`` for the worker script,
+script transfer path, input trigger files, output files, and output remaps,
+respectively, and must contain ``@LOG_DIR@`` and
+``@POST_PROCESS_GROUP@`` placeholders. The worker environment must provide
+``omicron-merge-with-gaps`` and its merge utilities on ``PATH``; set this
+explicitly in the template's ``environment`` setting because the template
+does not inherit the submit host's environment.
+
 ----------------------------
 Archiving multiple workflows
 ----------------------------
