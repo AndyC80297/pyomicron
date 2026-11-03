@@ -380,8 +380,7 @@ https://pyomicron.readthedocs.io/en/latest/"""
         '--condor-submit-template',
         type=Path,
         help='LIGO DAG-node submit template; transfers the generated '
-             'parameters and frame files to the worker. The one-node test '
-             'requires one segment and parameter file; the template must '
+             'parameters and frame files to each worker. The template must '
              'include the required placeholders and use queue 1',
     )
     condorg.add_argument(
@@ -1046,12 +1045,6 @@ def main(args=None):
     elif len(segs) == 0:
         raise RuntimeError("No analysable segments found")
 
-    if args.condor_submit_template and newdag and len(segs) != 1:
-        raise ValueError(
-            "The LIGO submit-template test requires exactly one "
-            "analyzable data segment; narrow the --gps interval",
-        )
-
     # and calculate trigger output segments
     trigsegs = type(segs)(type(s)(*s) for s in segs).contract(padding)
 
@@ -1141,8 +1134,9 @@ def main(args=None):
     if args.condor_submit_template and newdag:
         if len(jobfiles) != 1:
             raise ValueError(
-                "The LIGO submit-template test creates one DAG node; "
-                "increase --max-channels-per-job to include all channels",
+                "The LIGO submit template requires all channels in one "
+                "parameter file; increase --max-channels-per-job to include "
+                "all channels",
             )
         # Keep the archived master parameters file usable from the run
         # directory; only the per-node files use sandbox-relative paths.
@@ -1274,17 +1268,7 @@ def main(args=None):
 
         # distribute segment across multiple nodes
         nperjob = args.max_chunks_per_job
-        if args.condor_submit_template and newdag:
-            chunk = oconfig.getfloat('PARAMETER', 'PSDLENGTH')
-            overlap = oconfig.getfloats('PARAMETER', 'TIMING')[1]
-            step = int(chunk - overlap)
-            nperjob = max(nperjob, (e - s + step - 1) // step)
         nodesegs = oconfig.distribute_segment(s, e, nperjob=nperjob)
-        if args.condor_submit_template and newdag and len(nodesegs) != 1:
-            raise RuntimeError(
-                "The LIGO submit-template test could not combine the "
-                "selected segment into one Omicron node",
-            )
 
         omicronfiles = dict()
         # build node for each parameter file
