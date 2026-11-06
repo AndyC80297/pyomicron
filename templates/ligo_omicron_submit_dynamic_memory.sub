@@ -20,9 +20,10 @@ log                      = @LOG_DIR@/omicron-$(cluster)-$(process).log
 stream_output            = True
 stream_error             = True
 
-request_memory           = ifthenelse(isUndefined(MemoryUsage), 1024, int(3*MemoryUsage))
+request_cpus             = 1
+request_memory           = 4096 + 2048 * ifThenElse(isUndefined(NumJobStarts), 0, NumJobStarts)
 +InitialRequestMemory    = 4096
-request_disk             = 1G
+request_disk             = 4G
 periodic_release         = (HoldReasonCode =?= 26 || HoldReasonCode =?= 34) && (JobStatus == 5)
 periodic_remove          = (JobStatus == 1) && MemoryUsage >= 7000
 +OmicronProcess          = "@OMICRON_PROCESS@"

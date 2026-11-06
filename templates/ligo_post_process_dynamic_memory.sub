@@ -1,0 +1,34 @@
+universe                 = vanilla
+getenv                   = False
+
+executable               = /bin/bash
+transfer_executable      = False
+arguments                = "-e $(macroargument0)"
+
+should_transfer_files    = YES
+when_to_transfer_output  = ON_EXIT
+transfer_input_files     = $(macroargument1), $(macroargument2)
+transfer_output_files    = $(macroargument3)
+transfer_output_remaps   = "$(macroargument4)"
+
+accounting_group         = @CONDOR_ACCOUNTING_GROUP@
+accounting_group_user    = @CONDOR_ACCOUNTING_GROUP_USER@
++OmicronPostProcess      = "@POST_PROCESS_GROUP@"
+
+environment              = "PATH=/cvmfs/software.igwn.org/conda/envs/igwn-py311/bin:/usr/bin:/bin;HDF5_USE_FILE_LOCKING=FALSE"
+
+error                    = @LOG_DIR@/post-processing-$(cluster)-$(process).err
+output                   = @LOG_DIR@/post-processing-$(cluster)-$(process).out
+log                      = @LOG_DIR@/post-processing-$(cluster)-$(process).log
+stream_output             = True
+stream_error              = True
+
+request_cpus             = 1
+request_memory           = 4096 + 2048 * ifThenElse(isUndefined(NumJobStarts), 0, NumJobStarts)
++InitialRequestMemory    = 4096
+request_disk             = 4G
+periodic_release         = (HoldReasonCode =?= 26 || HoldReasonCode =?= 34) && (JobStatus == 5)
+periodic_remove          = (JobStatus == 1) && MemoryUsage >= 7000
++OmicronProcess          = "@OMICRON_PROCESS@"
+
+queue 1
