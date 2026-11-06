@@ -67,6 +67,7 @@ import argparse
 import configparser
 import os
 import re
+import shlex
 import sys
 import shutil
 import time
@@ -94,8 +95,162 @@ except RuntimeError:
     OMICRON_PATH = None
 
 DAG_TAG = "omicron"
+LIGO_SUBMIT_TEMPLATE_FIELDS = (
+    "@WORKER_SCRIPT@",
+    "@WORKER_NAME@",
+    "@FRAME_CACHE@",
+    "@FRAME_FILES@",
+    "@TRIGGER_OUTPUT_FILES@",
+    "@TRIGGER_OUTPUT_REMAPS@",
+    "@LOG_DIR@",
+)
 
 logger = log.Logger('omicron-process')
+
+
+def write_ligo_submit_file(template, outfile, worker_script, frame_cache,
+                           frame_files, channels, trigger_output_dir,
+                           log_dir, group):
+    """Write a DAG-compatible submit file from a LIGO submit template."""
+    contents = Path(template).read_text()
+    required = LIGO_SUBMIT_TEMPLATE_FIELDS + tuple(
+        f"$(macroargument{i})" for i in range(4)
+    )
+    missing = [field for field in required if field not in contents]
+    if missing:
+        raise ValueError(
+            "LIGO submit template is missing required placeholders or DAG "
+            "arguments: "
+            + ", ".join(missing),
+        )
+    channels = tuple(channels)
+    if not channels:
+        raise ValueError("No channels were provided for output transfer")
+    if any("," in channel or ";" in channel for channel in channels):
+        raise ValueError(
+            "Channel names containing commas or semicolons cannot be used "
+            "with HTCondor output transfer",
+        )
+    if not any(
+        line.strip().lower() == "queue 1"
+        for line in contents.splitlines()
+    ):
+        raise ValueError("LIGO DAG-node submit template must contain `queue 1`")
+
+    replacements = {
+        "@WORKER_SCRIPT@": str(worker_script),
+        "@WORKER_NAME@": Path(worker_script).name,
+        "@FRAME_CACHE@": str(frame_cache),
+        "@FRAME_FILES@": ", ".join(map(str, frame_files)),
+        "@TRIGGER_OUTPUT_FILES@": ", ".join(channels),
+        "@TRIGGER_OUTPUT_REMAPS@": "; ".join(
+            f"{channel} = {Path(trigger_output_dir) / channel}"
+            for channel in channels
+        ),
+        "@LOG_DIR@": str(log_dir),
+        "@OMICRON_PROCESS@": group,
+    }
+    for field, value in replacements.items():
+        contents = contents.replace(field, value)
+    Path(outfile).write_text(contents)
+
+
+def post_process_output_names(inputfiles, no_merge=False, no_gzip=False):
+    """Predict the output basenames produced by omicron-merge-with-gaps."""
+    if no_merge:
+        return [Path(path).name for path in inputfiles]
+
+    pattern = re.compile(r'^(.+)-(\d+)-(\d+)\.(.+)$')
+    output_names = []
+    current_name = None
+    current_ext = None
+    start_time = None
+    end_time = None
+    start_day = None
+
+    def add_current():
+        if start_time is None:
+            return
+        ext = current_ext
+        if 'xml' in ext and not no_gzip:
+            ext += '.gz'
+        output_names.append(
+            f'{current_name}-{start_time}-{end_time - start_time}.{ext}',
+        )
+
+    for path in inputfiles:
+        match = pattern.match(Path(path).name)
+        if match is None:
+            raise ValueError(
+                f"Cannot determine post-processing output for {path!r}",
+            )
+        name, start, duration, ext = match.groups()
+        start = int(start)
+        end = start + int(duration)
+        day = start // 100000
+
+        if current_name is None:
+            current_name, current_ext = name, ext
+            start_time, end_time, start_day = start, end, day
+        elif (
+            name == current_name
+            and ext == current_ext
+            and start == end_time
+            and day == start_day
+        ):
+            end_time = end
+        else:
+            add_current()
+            current_name, current_ext = name, ext
+            start_time, end_time, start_day = start, end, day
+
+    add_current()
+    return output_names
+
+
+def write_post_process_submit_file(
+    template,
+    outfile,
+    log_dir,
+    group,
+    accounting_group,
+    accounting_group_user,
+):
+    """Write the post-processing submit file from a user-provided template."""
+    contents = Path(template).read_text()
+    required = (
+        "@LOG_DIR@",
+        "@POST_PROCESS_GROUP@",
+        "@CONDOR_ACCOUNTING_GROUP@",
+        "@CONDOR_ACCOUNTING_GROUP_USER@",
+        *(f"$(macroargument{i})" for i in range(5)),
+    )
+    missing = [field for field in required if field not in contents]
+    if missing:
+        raise ValueError(
+            "Post-processing submit template is missing required "
+            "placeholders or DAG arguments: "
+            + ", ".join(missing),
+        )
+    if not any(
+        line.strip().lower() == "queue 1"
+        for line in contents.splitlines()
+    ):
+        raise ValueError(
+            "Post-processing submit template must contain `queue 1`",
+        )
+
+    contents = contents.replace("@LOG_DIR@", str(log_dir))
+    contents = contents.replace("@POST_PROCESS_GROUP@", group)
+    contents = contents.replace(
+        "@CONDOR_ACCOUNTING_GROUP@",
+        accounting_group,
+    )
+    contents = contents.replace(
+        "@CONDOR_ACCOUNTING_GROUP_USER@",
+        accounting_group_user,
+    )
+    Path(outfile).write_text(contents)
 
 
 def clean_exit(exitcode, tempfiles=None):
@@ -320,6 +475,25 @@ https://pyomicron.readthedocs.io/en/latest/"""
         help='condor universe (default: %(default)s)',
     )
     condorg.add_argument(
+        '--condor-submit-template',
+        type=Path,
+        help='LIGO DAG-node submit template; transfers the generated '
+             'parameters and frame files to each worker. The template must '
+             'include the required placeholders and use queue 1',
+    )
+    condorg.add_argument(
+        '--post-process-template',
+        type=Path,
+        help='DAG-node submit template for post-processing; transfers the '
+             'trigger files to each worker and returns merged outputs',
+    )
+    condorg.add_argument(
+        '--worker-executable',
+        default='/cvmfs/software.igwn.org/conda/envs/igwn-py311/bin/omicron',
+        help='Omicron executable available on the worker when using '
+             '--condor-submit-template (default: %(default)s)',
+    )
+    condorg.add_argument(
         '--executable',
         default=OMICRON_PATH,
         help='omicron executable (default: %(default)s)',
@@ -467,6 +641,25 @@ def main(args=None):
 
     parser = create_parser()
     args = parser.parse_args(args=args)
+
+    if args.condor_submit_template and not args.condor_submit_template.is_file():
+        parser.error(
+            f"LIGO submit template does not exist: "
+            f"{args.condor_submit_template}",
+        )
+    if args.post_process_template and not args.post_process_template.is_file():
+        parser.error(
+            "Post-processing submit template does not exist: "
+            f"{args.post_process_template}",
+        )
+    if args.condor_submit_template and args.skip_omicron:
+        parser.error(
+            "--condor-submit-template cannot be used with --skip-omicron",
+        )
+    if args.post_process_template and args.skip_postprocessing:
+        parser.error(
+            "--post-process-template cannot be used with --skip-postprocessing",
+        )
 
     # apply verbosity to logger
     args.verbose = max(5 - args.verbose, 0)
@@ -671,6 +864,11 @@ def main(args=None):
     # convert to omicron parameters format
     oconfig = parameters.OmicronParameters.from_channel_list_config(
         cp, group, version=omicronv)
+
+    # set output format to root and hdf5 if using LIGO submit template
+    if args.condor_submit_template:
+        oconfig.set('OUTPUT', 'FORMAT', 'root hdf5')
+
     # and validate things
     oconfig.validate()
 
@@ -988,12 +1186,82 @@ def main(args=None):
     # -- make parameters files then generate the DAG --------------------------
 
     fileformats = oconfig.output_formats()
+    transfer_frames = []
+    transfer_cache = None
+    omicron_worker_script = None
+    if args.condor_submit_template and newdag:
+        transfer_frames = list(dict.fromkeys(
+            Path(data.path_from_file_url(str(frame))).resolve()
+            for frame in cache
+        ))
+        if not transfer_frames:
+            raise RuntimeError(
+                "No frame files are available to transfer to the LIGO worker",
+            )
+        if any(not frame.is_file() for frame in transfer_frames):
+            raise RuntimeError(
+                "Cannot transfer one or more frame files because they are "
+                "not accessible as local files",
+            )
+        frame_names = [frame.name for frame in transfer_frames]
+        if len(set(frame_names)) != len(frame_names):
+            raise ValueError(
+                "Frame files with duplicate basenames cannot be transferred "
+                "to a single worker directory",
+            )
+        if any(',' in str(frame) for frame in transfer_frames):
+            raise ValueError(
+                "Frame file paths containing commas cannot be used with "
+                "HTCondor transfer_input_files",
+            )
+
+        group_tag = re.sub(r'[^A-Za-z0-9_-]+', '_', group)
+        frame_cache_name = f"frames-{group_tag}.lcf"
+        transfer_cache = condir / frame_cache_name
+        with cachefile.open() as source, transfer_cache.open("w") as target:
+            for line in source:
+                prefix, frame_path = line.rstrip().rsplit(maxsplit=1)
+                print(
+                    prefix,
+                    Path(data.path_from_file_url(frame_path)).name,
+                    file=target,
+                )
+        tempfiles.extend([transfer_cache])
+
+        omicron_worker_script = condir / f"omicron-worker-{group_tag}.sh"
+        with omicron_worker_script.open("w") as script:
+            print("#!/bin/bash -e", file=script)
+            print(
+                "exec {} \"$1\" \"$2\" \"$3\" strict".format(
+                    shlex.quote(args.worker_executable),
+                ),
+                file=script,
+            )
+        omicron_worker_script.chmod(0o755)
+        tempfiles.append(omicron_worker_script)
+
+        # These parameter-file paths are relative to the worker sandbox.
+        oconfig.set('DATA', 'FFL', frame_cache_name)
+        oconfig.set('OUTPUT', 'DIRECTORY', '.')
 
     # generate a 'master' parameters.txt file for archival purposes
     if not newdag:  # if not writing new dag, dump parameters.txt files to /tmp
         pardir = gettempdir()
     parfile, jobfiles = oconfig.write_distributed(
         pardir, nchannels=args.max_channels_per_job)
+    if args.condor_submit_template and newdag:
+        if len(jobfiles) != 1:
+            raise ValueError(
+                "The LIGO submit template requires all channels in one "
+                "parameter file; increase --max-channels-per-job to include "
+                "all channels",
+            )
+        # Keep the archived master parameters file usable from the run
+        # directory; only the per-node files use sandbox-relative paths.
+        oconfig.set('DATA', 'FFL', str(cachefile))
+        oconfig.set('OUTPUT', 'DIRECTORY', str(trigdir))
+        with open(parfile, 'w') as f:
+            oconfig.write(f)
     logger.debug(f"Created master parameters file\n{parfile}")
     if newdag:
         keepfiles.append(parfile)
@@ -1082,6 +1350,8 @@ def main(args=None):
 
     goterr = list()
     for exe in prog_path.keys():
+        if args.post_process_template and exe == 'omicron-merge':
+            continue
         if not prog_path[exe]:
             logger.critical(f'required program: {prog_path[exe]} not found')
             goterr.append(exe)
@@ -1117,8 +1387,8 @@ def main(args=None):
         td = te - ts
 
         # distribute segment across multiple nodes
-        nodesegs = oconfig.distribute_segment(
-            s, e, nperjob=args.max_chunks_per_job)
+        nperjob = args.max_chunks_per_job
+        nodesegs = oconfig.distribute_segment(s, e, nperjob=nperjob)
 
         omicronfiles = dict()
         # build node for each parameter file
@@ -1137,6 +1407,8 @@ def main(args=None):
                     node.add_var_arg(str(subseg[0]))
                     node.add_var_arg(str(subseg[1]))
                     node.add_file_arg(pf)
+                    if args.condor_submit_template and newdag:
+                        node.add_var_arg(Path(pf).name)
                     # we need to ignore errors in individual nodes
                     node.set_post_script(shutil.which('bash'))
                     node.add_post_script_arg('-c')
@@ -1164,7 +1436,9 @@ def main(args=None):
             if not args.skip_postprocessing:
                 script = condir / "post-process-{}-{}-{}.sh".format(i, s, e)
                 ppnode = pipeline.CondorDAGNode(ppjob)
-                ppnode.add_var_arg(str(script))
+                worker_operations = []
+                post_process_inputs = []
+                post_process_outputs = []
                 operations = []
 
                 # build post-processing nodes for each channel
@@ -1180,30 +1454,67 @@ def main(args=None):
 
                     # add ROOT operations
                     if 'root' in fileformats:
-                        rootfiles = ' '.join(omicronfiles[c]['root'])
+                        root_inputs = omicronfiles[c]['root']
+                        rootfiles = ' '.join(root_inputs)
                         for f in omicronfiles[c]['root']:
                             ppnode.add_input_file(f)
                         no_merge = '--no-merge' if args.skip_root_merge else ''
 
                         operations.append(f'  {prog_path["omicron-merge"]} {no_merge}  '
                                           f'--out-dir {mergepath} {rootfiles} ')
+                        worker_operations.append(
+                            '  omicron-merge-with-gaps {} --out-dir . {}'.format(
+                                no_merge,
+                                ' '.join(
+                                    shlex.quote(Path(path).name)
+                                    for path in root_inputs
+                                ),
+                            ),
+                        )
+                        post_process_inputs.extend(root_inputs)
+                        post_process_outputs.extend(
+                            (name, Path(mergepath) / name)
+                            for name in post_process_output_names(
+                                root_inputs,
+                                no_merge=args.skip_root_merge,
+                            )
+                        )
                         rmfiles.append(rootfiles)
 
                     # add HDF5 operations
                     if 'hdf5' in fileformats:
-                        hdf5files = ' '.join(omicronfiles[c]['hdf5'])
+                        hdf5_inputs = omicronfiles[c]['hdf5']
+                        hdf5files = ' '.join(hdf5_inputs)
                         for f in omicronfiles[c]['hdf5']:
                             ppnode.add_input_file(f)
-                        no_merge = '--no-merge' if args.skip_root_merge else ''
+                        no_merge = '--no-merge' if args.skip_hdf5_merge else ''
 
                         operations.append(
                             f'  {prog_path["omicron-merge"]} {no_merge}  '
                             f' --out-dir {mergepath} {hdf5files} ')
+                        worker_operations.append(
+                            '  omicron-merge-with-gaps {} --out-dir . {}'.format(
+                                no_merge,
+                                ' '.join(
+                                    shlex.quote(Path(path).name)
+                                    for path in hdf5_inputs
+                                ),
+                            ),
+                        )
+                        post_process_inputs.extend(hdf5_inputs)
+                        post_process_outputs.extend(
+                            (name, Path(mergepath) / name)
+                            for name in post_process_output_names(
+                                hdf5_inputs,
+                                no_merge=args.skip_hdf5_merge,
+                            )
+                        )
                         rmfiles.append(hdf5files)
 
                     # add LIGO_LW operations
                     if 'xml' in fileformats:
-                        xmlfiles = ' '.join(omicronfiles[c]['xml'])
+                        xml_inputs = omicronfiles[c]['xml']
+                        xmlfiles = ' '.join(xml_inputs)
                         for f in omicronfiles[c]['xml']:
                             ppnode.add_input_file(f)
 
@@ -1212,6 +1523,26 @@ def main(args=None):
                         operations.append(
                             f'  {prog_path["omicron-merge"]} {no_merge} {no_gzip} --uint-bug '
                             f' --out-dir {mergepath} {xmlfiles} ')
+                        worker_operations.append(
+                            '  omicron-merge-with-gaps {} {} --uint-bug '
+                            '--out-dir . {}'.format(
+                                no_merge,
+                                no_gzip,
+                                ' '.join(
+                                    shlex.quote(Path(path).name)
+                                    for path in xml_inputs
+                                ),
+                            ),
+                        )
+                        post_process_inputs.extend(xml_inputs)
+                        post_process_outputs.extend(
+                            (name, Path(mergepath) / name)
+                            for name in post_process_output_names(
+                                xml_inputs,
+                                no_merge=args.skip_ligolw_add,
+                                no_gzip=args.skip_gzip,
+                            )
+                        )
 
                         rmfiles.append(xmlfiles)
 
@@ -1229,6 +1560,72 @@ def main(args=None):
 
                 ppnode.set_category('postprocessing')
                 ppnode.set_retry(str(args.condor_retry))
+                if args.post_process_template and newdag:
+                    post_process_worker_script = condir / (
+                        f"post-process-worker-{i}-{s}-{e}.sh"
+                    )
+                    with post_process_worker_script.open("w") as f:
+                        print("#!/bin/bash -e\n", file=f)
+                        print("# Omicron post-processing worker", file=f)
+                        print('\n'.join(worker_operations), file=f)
+                    post_process_worker_script.chmod(0o755)
+                    tempfiles.append(post_process_worker_script)
+
+                    post_process_inputs = list(dict.fromkeys(
+                        post_process_inputs,
+                    ))
+                    output_names = [name for name, _ in post_process_outputs]
+                    if not post_process_inputs or not post_process_outputs:
+                        raise ValueError(
+                            "The post-processing submit template requires "
+                            "ROOT, HDF5, or XML trigger outputs",
+                        )
+                    if len(output_names) != len(set(output_names)):
+                        raise ValueError(
+                            "Post-processing output filenames are not unique "
+                            f"for segment [{s}, {e})",
+                        )
+                    transfer_paths = [
+                        str(path)
+                        for path in (*post_process_inputs, post_process_worker_script)
+                    ]
+                    remap_paths = [
+                        str(path) for _, path in post_process_outputs
+                    ]
+                    if any(
+                        any(char in path for char in ',;"\r\n')
+                        or any(char.isspace() for char in path)
+                        for path in transfer_paths
+                    ) or any(
+                        any(char in name for char in ',;"\r\n')
+                        or any(char in path for char in ';="\r\n')
+                        for (name, _), path in zip(
+                            post_process_outputs,
+                            remap_paths,
+                        )
+                    ):
+                        raise ValueError(
+                            "Post-processing transfer paths cannot contain "
+                            "spaces, commas, semicolons, quotes, or newlines; "
+                            "remap paths also cannot contain equals signs",
+                        )
+
+                    ppnode.add_var_arg(post_process_worker_script.name)
+                    ppnode.add_var_arg(str(post_process_worker_script))
+                    ppnode.add_var_arg(','.join(post_process_inputs))
+                    ppnode.add_var_arg(','.join(output_names))
+                    ppnode.add_var_arg(';'.join(
+                        f"{name} = {path}"
+                        for name, path in post_process_outputs
+                    ))
+                    ppnode.add_input_file(str(post_process_worker_script))
+                    for _, output_path in post_process_outputs:
+                        output_path.parent.mkdir(parents=True, exist_ok=True)
+                        ppnode._CondorDAGNode__output_files.append(
+                            str(output_path),
+                        )
+                else:
+                    ppnode.add_var_arg(str(script))
                 if not args.skip_omicron:
                     for node in nodes:
                         ppnode.add_parent(node)
@@ -1345,6 +1742,27 @@ def main(args=None):
         )
     elif newdag:
         dag.write_sub_files()
+        if args.condor_submit_template:
+            write_ligo_submit_file(
+                args.condor_submit_template,
+                ojob.get_sub_file(),
+                omicron_worker_script,
+                transfer_cache,
+                transfer_frames,
+                oconfig.getlist('DATA', 'CHANNELS'),
+                trigdir,
+                logdir,
+                group,
+            )
+        if args.post_process_template:
+            write_post_process_submit_file(
+                args.post_process_template,
+                ppjob.get_sub_file(),
+                logdir,
+                group,
+                args.condor_accounting_group,
+                args.condor_accounting_group_user,
+            )
         dag.write_dag()
         dag.write_script()
         with open(dagfile, 'a') as f:
